@@ -1,0 +1,31 @@
+# --- Segurança (CRÍTICO) ---
+.env
+.env.local
+config.py
+secrets.py
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Ambientes Virtuais ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Banco de Dados (SQLite) ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Logs (Para não sujar o projeto) ---
+*.log
+logs/
+
+# --- IDEs e Sistema Operacional ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
