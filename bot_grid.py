@@ -20,7 +20,7 @@ class GridBot:
         self._connect_exchange()
         self.market_precision = None
         self.min_amount = None
-        self.min_cost = None
+        self.min_cost = 10
 
     def _setup_logging(self):
         logging.basicConfig(
@@ -48,7 +48,10 @@ class GridBot:
         self.GRID_LEVELS = int(os.getenv('GRID_LEVELS', 10))
         self.INVESTMENT_PER_GRID = float(os.getenv('AMOUNT_PER_GRID_USDT', 15))
         
+        # Criar conexão global SQLite
         self.DB_NAME = "grid_data.db"
+        self.conn = sqlite3.connect(self.DB_NAME, timeout=15, check_same_thread=False)
+        self.cursor = self.conn.cursor()
 
     def _connect_exchange(self):
         if not self.API_KEY or not self.SECRET_KEY:
@@ -63,23 +66,24 @@ class GridBot:
         })
         
         self.logger.info("Carregando mercados da Binance...")
+        self.telegram_send("Carregando mercados da Binance...")
         self.markets = self.exchange.load_markets()
         
         # Carregar precisões do par para evitar erros de API
         market = self.markets[self.SYMBOL]
+
         self.min_amount = market['limits']['amount']['min']
-        self.min_cost = market['limits']['cost']['min']
+        self.min_cost   = market['limits']['cost']['min']
+
+        if self.min_cost is None:
+            self.min_cost = 10
+
         self.logger.info(f"Conectado! Par: {self.SYMBOL} | Min Cost: {self.min_cost}")
+        self.telegram_send(f"Conectado! Par: {self.SYMBOL} | Min Cost: {self.min_cost}")
 
     def _init_db(self):
-        """Cria tabela para rastrear as ordens ativas do Grid"""
-        conn = sqlite3.connect(self.DB_NAME)
-        cursor = conn.cursor()
-        
-        # Tabela de Grids: Rastreia cada linha
-        # status: 'OPEN' (Esperando execução), 'FILLED' (Executada, aguardando oposta)
-        # side: 'BUY' ou 'SELL'
-        cursor.execute('''
+        """Cria tabelas necessárias"""
+        self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS active_grids (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 grid_index INTEGER,
@@ -91,23 +95,25 @@ class GridBot:
                 updated_at TEXT
             )
         ''')
-        
-        # Tabela de Histórico de Lucros
-        cursor.execute('''
+
+        self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS profits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 profit_usdt REAL,
                 timestamp TEXT
             )
         ''')
-        conn.commit()
-        conn.close()
+
+        self.conn.commit()
 
     def telegram_send(self, message):
-        if not self.TG_TOKEN or not self.TG_CHAT_ID: return
+
         try:
-            url = f"https://api.telegram.org/bot{self.TG_TOKEN}/sendMessage"
-            requests.post(url, json={"chat_id": self.TG_CHAT_ID, "text": message}, timeout=5)
+            token = os.getenv('TELEGRAM_TOKEN')
+            chat_id = os.getenv('TELEGRAM_CHAT_ID')
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+            requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=5)
         except Exception as e:
             self.logger.error(f"Erro Telegram: {e}")
 
@@ -116,168 +122,146 @@ class GridBot:
     # ==========================
 
     def calculate_grid_lines(self):
-        """Gera os preços das linhas do Grid (Aritmético)"""
         step = (self.UPPER_PRICE - self.LOWER_PRICE) / self.GRID_LEVELS
         prices = [self.LOWER_PRICE + (i * step) for i in range(self.GRID_LEVELS + 1)]
         return prices, step
 
     def initialize_grid(self):
-        """
-        Executado apenas na primeira vez. Verifica onde o preço está 
-        e coloca ordens de COMPRA abaixo e VENDA acima (se tiver saldo).
-        """
-        conn = sqlite3.connect(self.DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT count(*) FROM active_grids WHERE status='OPEN'")
-        active_orders = cursor.fetchone()[0]
+        """Executado somente quando não há ordens ativas"""
+        self.cursor.execute("SELECT count(*) FROM active_grids WHERE status='OPEN'")
+        active_orders = self.cursor.fetchone()[0]
         
         if active_orders > 0:
-            self.logger.info(f"Reiniciando com {active_orders} ordens já ativas no banco de dados.")
-            conn.close()
+            self.logger.info(f"Reiniciando com {active_orders} ordens existentes...")
+            self.telegram_send(f"Reiniciando com {active_orders} ordens existentes...")
             return
 
-        self.logger.info("⚡ Iniciando NOVO Grid...")
         ticker = self.exchange.fetch_ticker(self.SYMBOL)
         current_price = ticker['last']
-        
+
         grid_prices, step = self.calculate_grid_lines()
-        
-        self.telegram_send(f"🤖 **GRID BOT INICIADO**\nPreço Atual: {current_price}\nFaixa: {self.LOWER_PRICE} - {self.UPPER_PRICE}\nGrids: {self.GRID_LEVELS}")
+
+        self.telegram_send(f"🤖 GRID INICIADO\nPreço Atual: {current_price}")
 
         for i, price in enumerate(grid_prices):
-            # Não coloca ordem muito perto do preço atual (evita execução imediata indesejada na criação)
             if abs(price - current_price) / current_price < 0.002:
                 continue
 
             if price < current_price:
-                # Abaixo do preço atual -> Colocar Ordem de COMPRA
                 self.place_order(price, 'BUY', i)
-            
-            # Nota: Em um grid "neutro", você precisaria ter BTC para colocar as ordens de VENDA acima.
-            # Este bot assume que começamos em USDT, então ele só coloca COMPRAS inicialmente.
-            # As VENDAS só são criadas depois que uma compra é executada.
-        
-        conn.close()
 
     def place_order(self, price, side, grid_index):
-        """Calcula precisão e envia ordem para Binance"""
         amount_btc = self.INVESTMENT_PER_GRID / price
         
-        # Ajustes de precisão da Binance
         amount_final = self.exchange.amount_to_precision(self.SYMBOL, amount_btc)
         price_final = self.exchange.price_to_precision(self.SYMBOL, price)
-        
-        # Validação de Custo Mínimo ($10 normalmente)
+            
         cost = float(amount_final) * float(price_final)
-        if cost < self.min_cost:
-            self.logger.warning(f"Ordem ignorada: Valor ${cost:.2f} menor que o mínimo da exchange.")
+
+        # ===============================
+        # VALIDAÇÃO DO SALDO NA BINANCE
+        # ===============================
+        free_usdt = self.get_free_balance_usdt()
+        if free_usdt < cost:
+            self.logger.warning(f"Saldo insuficiente: precisa {cost:.2f} USDT, mas tem {free_usdt:.2f} USDT. Ordem ignorada.")
+            self.telegram_send(f"Saldo insuficiente: precisa {cost:.2f} USDT, mas tem {free_usdt:.2f} USDT. Ordem ignorada.")
             return
 
-        order_id = "SIM_" + str(int(time.time()*1000))
-        
+        # if cost < self.min_cost:
+        #     self.logger.warning(f"Ordem ignorada: valor {cost} menor que mínimo.")
+        #     return
+        # ===============================
+
+        order_id = f"SIM_{int(time.time()*1000)}"
+
         if not self.SIMULATION:
             try:
-                if side == 'BUY':
+                if side == "BUY":
                     order = self.exchange.create_limit_buy_order(self.SYMBOL, amount_final, price_final)
                 else:
                     order = self.exchange.create_limit_sell_order(self.SYMBOL, amount_final, price_final)
-                order_id = order['id']
-                self.logger.info(f"✅ Ordem {side} criada em ${price_final} | ID: {order_id}")
+                order_id = order["id"]
+                
+                self.telegram_send(f"📌 Ordem REAL {side} criada\nPreço: {price_final}\nQtd: {amount_final}")
+        
             except Exception as e:
-                self.logger.error(f"Erro ao criar ordem na Binance: {e}")
+                self.logger.error(f"Erro ao criar ordem real: {e}")
+                self.telegram_send(f"Erro ao criar ordem real: {e}")
                 return
         else:
-            self.logger.info(f"📢 [SIMULADO] Ordem {side} colocada em ${price_final}")
-
-        # Salvar no Banco
-        conn = sqlite3.connect(self.DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute('''
+            self.logger.info(f"[SIM] Ordem {side} criada em {price_final}")
+            self.telegram_send(f"[SIM] Ordem {side} criada em {price_final}")
+        self.cursor.execute('''
             INSERT INTO active_grids (grid_index, order_id, price, side, amount, status, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', (grid_index, order_id, float(price_final), side, float(amount_final), 'OPEN', datetime.now()))
-        conn.commit()
-        conn.close()
+        self.conn.commit()
 
     def check_orders(self):
-        """Loop principal: Verifica status das ordens e repõe o grid"""
-        conn = sqlite3.connect(self.DB_NAME)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        # Buscar todas ordens ABERTAS
-        cursor.execute("SELECT * FROM active_grids WHERE status='OPEN'")
-        open_orders = cursor.fetchall()
-        
+        """Verifica ordens e repõe grid"""
+        self.cursor.execute("SELECT * FROM active_grids WHERE status='OPEN'")
+        open_orders = self.cursor.fetchall()
+
         grid_prices, step = self.calculate_grid_lines()
 
+        ticker = self.exchange.fetch_ticker(self.SYMBOL)
+        curr = ticker['last']
+
         for row in open_orders:
-            order_id = row['order_id']
-            side = row['side']
-            grid_index = row['grid_index']
-            price = row['price']
-            amount = row['amount']
-            
-            is_filled = False
-            
-            if self.SIMULATION:
-                # Na simulação, verificamos o preço atual
-                ticker = self.exchange.fetch_ticker(self.SYMBOL)
-                curr = ticker['last']
-                if side == 'BUY' and curr <= price: is_filled = True
-                if side == 'SELL' and curr >= price: is_filled = True
-            else:
-                try:
-                    order_info = self.exchange.fetch_order(order_id, self.SYMBOL)
-                    if order_info['status'] == 'closed' or order_info['status'] == 'filled':
-                        is_filled = True
-                except Exception as e:
-                    self.logger.error(f"Erro checando ordem {order_id}: {e}")
-                    continue
+            order_id = row[2]
+            price = row[3]
+            side = row[4]
+            amount = row[5]
+            grid_index = row[1]
 
-            if is_filled:
-                self.logger.info(f"💰 Ordem {side} EXECULTADA em ${price}!")
-                
-                # 1. Marcar como FILLED no DB
-                cursor.execute("UPDATE active_grids SET status='FILLED' WHERE id=?", (row['id'],))
-                
-                # 2. Criar a ordem OPOSTA (A mágica do Grid)
-                if side == 'BUY':
-                    # Comprou barato, agora coloca venda no grid de cima
+            # SIMULAÇÃO
+            filled = (
+                (side == 'BUY'  and curr <= price) or
+                (side == 'SELL' and curr >= price)
+            )
+
+            if filled:
+                self.cursor.execute("UPDATE active_grids SET status='FILLED' WHERE id=?", (row[0],))
+                self.conn.commit()
+
+                if side == "BUY":
                     new_price = price + step
-                    self.telegram_send(f"🔵 **COMPRA Executada** a ${price}\nArmando venda em ${new_price:.2f}")
-                    self.place_order(new_price, 'SELL', grid_index + 1)
-                    
-                elif side == 'SELL':
-                    # Vendeu caro, agora coloca recompra no grid de baixo
-                    new_price = price - step
-                    profit = (price - (price - step)) * amount # Lucro bruto aproximado
-                    
-                    self.logger.info(f"💵 LUCRO REALIZADO: +${profit:.2f} USDT")
-                    self.telegram_send(f"🟢 **VENDA (LUCRO)** a ${price}\nGanho: ${profit:.2f}\nRearmando compra em ${new_price:.2f}")
-                    
-                    # Registrar lucro
-                    cursor.execute("INSERT INTO profits (profit_usdt, timestamp) VALUES (?, ?)", (profit, datetime.now()))
-                    
-                    # Repor a grade (comprar de volta mais barato)
-                    self.place_order(new_price, 'BUY', grid_index - 1)
+                    self.place_order(new_price, "SELL", grid_index + 1)
 
-        conn.commit()
-        conn.close()
+                else:  # SELL
+                    new_price = price - step
+                    profit = (price - (price - step)) * amount
+                    self.cursor.execute(
+                        "INSERT INTO profits (profit_usdt, timestamp) VALUES (?, ?)",
+                        (profit, datetime.now())
+                    )
+                    self.conn.commit()
+
+                    self.place_order(new_price, "BUY", grid_index - 1)
+
+    def get_free_balance_usdt(self):
+        try:
+            balance = self.exchange.fetch_balance()
+
+            return balance['free']['USDT']
+        except Exception as e:
+            self.logger.error(f"Erro ao obter saldo: {e}")
+            self.telegram_send(f"Erro ao obter saldo: {e}")
+            return 0
 
     def run(self):
         self.initialize_grid()
         self.logger.info("Monitorando o Grid...")
+        self.telegram_send("Monitorando o Grid...")
         while True:
             try:
                 self.check_orders()
-                time.sleep(10) # Verifica a cada 10 segundos
-            except KeyboardInterrupt:
-                self.logger.info("Parando bot...")
-                break
+                time.sleep(10)
             except Exception as e:
                 self.logger.error(f"Erro no loop principal: {e}")
+                self.telegram_send(f"Erro no loop principal: {e}")
                 time.sleep(5)
+
 
 # ==========================================
 # EXECUÇÃO
