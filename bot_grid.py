@@ -62,18 +62,25 @@ class GridBot:
             'apiKey': self.API_KEY,
             'secret': self.SECRET_KEY,
             'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
+            'options': {
+                'defaultType': 'spot',
+                'adjustForTimeDifference': True,
+                'fetchCurrencies': False,     # 🚀 FIX 100% EFETIVO
+            }
         })
-        
+
+        # Desativa hard o fetch de currencies (ccxt ignora em alguns casos)
+        self.exchange.options['fetchCurrencies'] = False
+
         self.logger.info("Carregando mercados da Binance...")
         self.telegram_send("Carregando mercados da Binance...")
 
-        # ⚠️ FIX DO ERRO 451 (location restricted)
         try:
+            # 🔥 Agora o ccxt não usa mais endpoints restritos
             self.markets = self.exchange.load_markets()
         except Exception as e:
-            self.logger.warning(f"Erro ao carregar moedas (ignorando currencies): {e}")
-            self.markets = self.exchange.load_markets({'fetchCurrencies': False})
+            self.logger.error(f"Erro ao carregar mercados: {e}")
+            sys.exit(1)
 
         # Carregar precisões do par
         market = self.markets[self.SYMBOL]
@@ -86,6 +93,7 @@ class GridBot:
 
         self.logger.info(f"Conectado! Par: {self.SYMBOL} | Min Cost: {self.min_cost}")
         self.telegram_send(f"Conectado! Par: {self.SYMBOL} | Min Cost: {self.min_cost}")
+
 
     def _init_db(self):
         """Cria tabelas necessárias"""
