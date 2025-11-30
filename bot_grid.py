@@ -67,9 +67,15 @@ class GridBot:
         
         self.logger.info("Carregando mercados da Binance...")
         self.telegram_send("Carregando mercados da Binance...")
-        self.markets = self.exchange.load_markets()
-        
-        # Carregar precisões do par para evitar erros de API
+
+        # ⚠️ FIX DO ERRO 451 (location restricted)
+        try:
+            self.markets = self.exchange.load_markets()
+        except Exception as e:
+            self.logger.warning(f"Erro ao carregar moedas (ignorando currencies): {e}")
+            self.markets = self.exchange.load_markets({'fetchCurrencies': False})
+
+        # Carregar precisões do par
         market = self.markets[self.SYMBOL]
 
         self.min_amount = market['limits']['amount']['min']
@@ -107,7 +113,6 @@ class GridBot:
         self.conn.commit()
 
     def telegram_send(self, message):
-
         try:
             token = os.getenv('TELEGRAM_TOKEN')
             chat_id = os.getenv('TELEGRAM_CHAT_ID')
@@ -166,11 +171,6 @@ class GridBot:
             self.logger.warning(f"Saldo insuficiente: precisa {cost:.2f} USDT, mas tem {free_usdt:.2f} USDT. Ordem ignorada.")
             self.telegram_send(f"Saldo insuficiente: precisa {cost:.2f} USDT, mas tem {free_usdt:.2f} USDT. Ordem ignorada.")
             return
-
-        # if cost < self.min_cost:
-        #     self.logger.warning(f"Ordem ignorada: valor {cost} menor que mínimo.")
-        #     return
-        # ===============================
 
         order_id = f"SIM_{int(time.time()*1000)}"
 
@@ -242,7 +242,6 @@ class GridBot:
     def get_free_balance_usdt(self):
         try:
             balance = self.exchange.fetch_balance()
-
             return balance['free']['USDT']
         except Exception as e:
             self.logger.error(f"Erro ao obter saldo: {e}")
