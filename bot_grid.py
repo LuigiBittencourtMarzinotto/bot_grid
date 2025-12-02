@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 
 # ==========================================
-# CLASSE DE GERENCIAMENTO DO GRID V3
+# CLASSE DE GERENCIAMENTO DO GRID V4
 # ==========================================
 
 class GridBot:
@@ -18,8 +18,8 @@ class GridBot:
         self._load_config()
         self._init_db()
         self._connect_exchange()
-        self.logger.info("Inicializando lógica do GRID V3...")
-        self.telegram_send("🚀 GRID V3 iniciado.")
+        self.logger.info("Inicializando lógica do GRID V4 (lucro real)...")
+        self.telegram_send("🚀 GRID V4 iniciado (lucro real habilitado).")
         self.logger.info(f"SIMULATION = {self.SIMULATION}")
         self.telegram_send(f"SIMULATION = {self.SIMULATION}")
 
@@ -49,7 +49,7 @@ class GridBot:
         self.TG_TOKEN = os.getenv('TELEGRAM_TOKEN')
         self.TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-        # Corrigido: default agora é 'false'
+        # Default agora é 'false'
         self.SIMULATION = str(os.getenv('MODO_SIMULACAO', 'false')).lower() == 'true'
 
         # Configurações do Grid (base)
@@ -132,6 +132,7 @@ class GridBot:
     # --------------------------------------
     def _init_db(self):
         """Cria tabelas necessárias"""
+        # Ordens de grid
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS active_grids (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,10 +146,43 @@ class GridBot:
             )
         ''')
 
+        # Lucro bruto aproximado (compatibilidade com versão antiga)
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS profits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 profit_usdt REAL,
+                timestamp TEXT
+            )
+        ''')
+
+        # Execuções reais de ordens (BUY/SELL) para montar ciclos
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS filled_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                grid_index INTEGER,
+                order_id TEXT,
+                side TEXT,
+                price REAL,
+                amount REAL,
+                fee REAL,
+                fee_currency TEXT,
+                timestamp TEXT,
+                used_in_cycle INTEGER DEFAULT 0
+            )
+        ''')
+
+        # Lucro real por ciclo (BUY -> SELL)
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS real_profits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT,
+                gross_profit REAL,
+                net_profit REAL,
+                buy_price REAL,
+                sell_price REAL,
+                amount REAL,
+                buy_fee REAL,
+                sell_fee REAL,
                 timestamp TEXT
             )
         ''')
@@ -288,12 +322,58 @@ class GridBot:
                 self.place_order(price, 'BUY', i)
 
     # --------------------------------------
+    # FUNÇÕES AUXILIARES DE ORDERS (REAL)
+    # --------------------------------------
+    def _fetch_order_safely(self, order_id: str):
+        """
+        Busca os dados reais da ordem na Binance, com tratamento de erro.
+        """
+        try:
+            order = self.exchange.fetch_order(order_id, self.SYMBOL)
+            return order
+        except Exception as e:
+            self.logger.error(f"Erro ao buscar detalhes da ordem {order_id}: {e}")
+            self.telegram_send(f"Erro ao buscar detalhes da ordem {order_id}: {e}")
+            return None
+
+    def _extract_exec_info(self, order, fallback_price: float, fallback_amount: float):
+        """
+        Extrai preço médio, quantidade e taxa de uma ordem da Binance.
+        """
+        if not order:
+            return fallback_price, fallback_amount, 0.0, self.QUOTE_ASSET
+
+        avg_price = float(order.get("average") or fallback_price or 0.0)
+        filled = float(order.get("filled") or fallback_amount or 0.0)
+
+        fee_cost = 0.0
+        fee_currency = self.QUOTE_ASSET
+
+        fee = order.get("fee")
+        fees = order.get("fees")
+
+        if fee:
+            try:
+                fee_cost = float(fee.get("cost") or 0.0)
+                fee_currency = fee.get("currency") or self.QUOTE_ASSET
+            except Exception:
+                pass
+        elif fees:
+            try:
+                fee_cost = sum(float(f.get("cost") or 0.0) for f in fees)
+                if fees and fees[0].get("currency"):
+                    fee_currency = fees[0].get("currency")
+            except Exception:
+                pass
+
+        return avg_price, filled, fee_cost, fee_currency
+
+    # --------------------------------------
     # ORDENS
     # --------------------------------------
     def place_order(self, price, side, grid_index):
         """
         Cria ordem REAL ou SIMULADA + grava no SQLite.
-        Agora faz checagem correta de saldo:
         - BUY -> checa saldo da quote (USDT)
         - SELL -> checa saldo da base (BTC)
         """
@@ -366,8 +446,8 @@ class GridBot:
     def check_orders(self):
         """
         Verifica ordens OPEN e executa lógica de grid:
-        - BUY preenchida -> marca FILLED, cria SELL acima
-        - SELL preenchida -> marca FILLED, registra lucro, cria BUY abaixo
+        - BUY preenchida -> marca FILLED, registra execução real, cria SELL acima
+        - SELL preenchida -> marca FILLED, registra lucro bruto + lucro líquido real, cria BUY abaixo
         """
         self.cursor.execute("SELECT * FROM active_grids WHERE status='OPEN'")
         open_orders = self.cursor.fetchall()
@@ -406,26 +486,116 @@ class GridBot:
             self.logger.info(f"Ordem {side} id={order_id} em {price} marcada como FILLED.")
             self.telegram_send(f"✅ Ordem {side} FILLED\nPreço: {price}\nGrid index: {grid_index}")
 
+            # Busca detalhes reais da ordem (se não estiver em simulação)
+            order_info = None
+            if not self.SIMULATION:
+                order_info = self._fetch_order_safely(order_id)
+
+            exec_price, exec_amount, exec_fee, exec_fee_currency = self._extract_exec_info(
+                order_info, price, amount
+            )
+
+            # Registra na tabela filled_orders
+            self.cursor.execute(
+                '''
+                INSERT INTO filled_orders
+                (grid_index, order_id, side, price, amount, fee, fee_currency, timestamp, used_in_cycle)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ''',
+                (grid_index, order_id, side, exec_price, exec_amount, exec_fee, exec_fee_currency, datetime.now())
+            )
+            self.conn.commit()
+
+            # Lógica de continuação do grid
             if side == "BUY":
                 # Cria SELL acima
                 new_price = price + self.grid_step
                 self.place_order(new_price, "SELL", grid_index + 1)
 
             else:  # SELL
-                # Calcula lucro aproximado de 1 step
+                # 1) Lucro aproximado (bruto, compatibilidade antiga)
                 buy_price_est = price - self.grid_step
-                profit = (price - buy_price_est) * amount
+                profit_est = (price - buy_price_est) * amount
 
                 self.cursor.execute(
                     "INSERT INTO profits (profit_usdt, timestamp) VALUES (?, ?)",
-                    (profit, datetime.now())
+                    (profit_est, datetime.now())
                 )
                 self.conn.commit()
 
-                self.logger.info(f"Lucro registrado: {profit:.4f} USDT.")
-                self.telegram_send(f"💰 Lucro: {profit:.4f} USDT")
+                self.logger.info(f"Lucro BRUTO estimado registrado: {profit_est:.4f} USDT.")
+                self.telegram_send(f"💰 Lucro BRUTO estimado: {profit_est:.4f} USDT")
 
-                # Cria BUY abaixo
+                # 2) Lucro REAL (ciclo BUY -> SELL)
+                #   - SELL em grid_index
+                #   - BUY correspondente em grid_index - 1
+                buy_grid_index = grid_index - 1
+                self.cursor.execute(
+                    '''
+                    SELECT id, price, amount, fee
+                    FROM filled_orders
+                    WHERE side='BUY'
+                      AND used_in_cycle=0
+                      AND grid_index=?
+                    ORDER BY id ASC
+                    LIMIT 1
+                    ''',
+                    (buy_grid_index,)
+                )
+                buy_row = self.cursor.fetchone()
+
+                if not buy_row:
+                    self.logger.warning(
+                        f"Nenhuma BUY disponível para formar ciclo com SELL id={order_id} grid_index={grid_index}."
+                    )
+                else:
+                    buy_id, buy_price_real, buy_amount_real, buy_fee_real = buy_row
+
+                    # Quantidade efetiva = mínimo entre buy e sell (por segurança)
+                    qty = min(float(buy_amount_real), float(exec_amount))
+
+                    gross_profit_real = (exec_price - buy_price_real) * qty
+                    net_profit_real = gross_profit_real - float(buy_fee_real or 0.0) - float(exec_fee or 0.0)
+
+                    self.cursor.execute(
+                        '''
+                        INSERT INTO real_profits
+                        (order_id, gross_profit, net_profit, buy_price, sell_price,
+                         amount, buy_fee, sell_fee, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''',
+                        (
+                            order_id,
+                            float(gross_profit_real),
+                            float(net_profit_real),
+                            float(buy_price_real),
+                            float(exec_price),
+                            float(qty),
+                            float(buy_fee_real or 0.0),
+                            float(exec_fee or 0.0),
+                            datetime.now()
+                        )
+                    )
+
+                    # Marca BUY como usada no ciclo
+                    self.cursor.execute(
+                        "UPDATE filled_orders SET used_in_cycle=1 WHERE id=?",
+                        (buy_id,)
+                    )
+
+                    self.conn.commit()
+
+                    msg = (
+                        f"💹 Lucro REAL Grid\n"
+                        f"Bruto: {gross_profit_real:.4f} USDT\n"
+                        f"Líquido (c/ taxas): {net_profit_real:.4f} USDT\n"
+                        f"BUY: {buy_price_real:.2f} | SELL: {exec_price:.2f}\n"
+                        f"Qtd: {qty:.6f}"
+                    )
+                    self.logger.info(msg)
+                    self.telegram_send(msg)
+
+                # 3) Cria BUY abaixo para manter o grid
                 new_price = price - self.grid_step
                 self.place_order(new_price, "BUY", grid_index - 1)
 
