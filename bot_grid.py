@@ -595,7 +595,18 @@ class GridBot:
                     self.logger.info(msg)
                     self.telegram_send(msg)
 
-                # 3) Cria BUY abaixo para manter o grid
+                ## 3) Cria BUY abaixo para manter o grid
+                new_price = price - self.grid_step
+
+                # Formata mensagem para o telegram
+                alert_msg = (
+                    f"📉 Próxima BUY prevista\n"
+                    f"Preço: {new_price:.2f}\n"
+                    f"Grid index: {grid_index - 1}"
+                )
+
+                self.logger.info(alert_msg)
+                self.telegram_send(alert_msg)
                 new_price = price - self.grid_step
                 self.place_order(new_price, "BUY", grid_index - 1)
 
