@@ -68,7 +68,7 @@ class GridBot:
 
         self.grid_step = self.RANGE_SIZE / self.GRID_LEVELS
 
-        # Valores que podem ser recalculados dinamicamente
+        # Valores que podem ser recalculados dinamicamente (grid dinâmico)
         self.LOWER_PRICE = self.BASE_LOWER_PRICE
         self.UPPER_PRICE = self.BASE_UPPER_PRICE
 
@@ -237,6 +237,7 @@ class GridBot:
         Ao reiniciar o bot, verifica ordens FILLED e recria a contraparte que faltar.
         - BUY FILLED sem SELL -> cria SELL (BUY -> SELL)
         - SELL FILLED sem BUY -> cria BUY (SELL -> BUY)
+        Respeitando limites de grid_index (0..GRID_LEVELS).
         """
         self.cursor.execute("SELECT id, grid_index, order_id, price, side, amount, status FROM active_grids")
         rows = self.cursor.fetchall()
@@ -246,7 +247,7 @@ class GridBot:
             return
 
         self.logger.info("Verificando ordens para recuperação retroativa...")
-        existing_map = {(r[1], r[4]): r for r in rows}  # (grid_index, side) -> row
+        existing_map = {(r[1], r[4], r[6]): r for r in rows}  # (grid_index, side, status) -> row
 
         for row in rows:
             _id, grid_index, order_id, price, side, amount, status = row
@@ -257,7 +258,11 @@ class GridBot:
             # BUY FILLED deve ter SELL correspondente
             if side == 'BUY':
                 target_index = grid_index + 1
-                if (target_index, 'SELL') not in existing_map:
+                if target_index > self.GRID_LEVELS:
+                    continue
+
+                # evita recriar se já tiver SELL OPEN nesse nível
+                if (target_index, 'SELL', 'OPEN') not in existing_map:
                     new_price = price + self.grid_step
                     self.logger.info(
                         f"Recuperando SELL perdida: BUY FILLED id={_id}, "
@@ -271,7 +276,10 @@ class GridBot:
             # SELL FILLED deve ter BUY correspondente
             elif side == 'SELL':
                 target_index = grid_index - 1
-                if (target_index, 'BUY') not in existing_map:
+                if target_index < 0:
+                    continue
+
+                if (target_index, 'BUY', 'OPEN') not in existing_map:
                     new_price = price - self.grid_step
                     self.logger.info(
                         f"Recuperando BUY perdida: SELL FILLED id={_id}, "
@@ -452,8 +460,11 @@ class GridBot:
         self.cursor.execute("SELECT * FROM active_grids WHERE status='OPEN'")
         open_orders = self.cursor.fetchall()
 
+        # Se não há nenhuma ordem OPEN, reconstruir GRID
         if not open_orders:
-            self.logger.info("Nenhuma ordem OPEN para verificar.")
+            self.logger.warning("Nenhuma ordem OPEN ativa. Reconstruindo GRID automaticamente.")
+            self.telegram_send("⚠️ Nenhuma ordem OPEN ativa. GRID será reconstruído.")
+            self.initialize_grid()
             return
 
         ticker = self.exchange.fetch_ticker(self.SYMBOL)
@@ -508,9 +519,38 @@ class GridBot:
 
             # Lógica de continuação do grid
             if side == "BUY":
-                # Cria SELL acima
-                new_price = price + self.grid_step
-                self.place_order(new_price, "SELL", grid_index + 1)
+                # Cria SELL acima (próximo nível)
+                next_index = grid_index + 1
+
+                if next_index > self.GRID_LEVELS:
+                    self.logger.info(
+                        f"Limite superior do GRID atingido no nível {grid_index}. "
+                        f"Não será criada SELL acima."
+                    )
+                    self.telegram_send(
+                        f"⚠️ Limite superior do GRID atingido.\n"
+                        f"Grid index atual: {grid_index}"
+                    )
+                else:
+                    new_price = price + self.grid_step
+
+                    # Verifica se já existe SELL OPEN nesse nível
+                    self.cursor.execute("""
+                        SELECT id FROM active_grids
+                        WHERE grid_index=? AND side='SELL' AND status='OPEN'
+                    """, (next_index,))
+                    existing_sell = self.cursor.fetchone()
+
+                    if existing_sell:
+                        self.logger.info(f"SELL no nível {next_index} já existente. Nenhuma nova SELL criada.")
+                        self.telegram_send(f"ℹ️ SELL do grid {next_index} já está ativa.")
+                    else:
+                        self.logger.info(f"Criando SELL no nível {next_index}, preço {new_price:.2f}")
+                        self.telegram_send(
+                            f"📈 Próxima SELL criada\n"
+                            f"Preço: {new_price:.2f}\nGrid index: {next_index}"
+                        )
+                        self.place_order(new_price, "SELL", next_index)
 
             else:  # SELL
                 # 1) Lucro aproximado (bruto, compatibilidade antiga)
@@ -595,20 +635,38 @@ class GridBot:
                     self.logger.info(msg)
                     self.telegram_send(msg)
 
-                ## 3) Cria BUY abaixo para manter o grid
-                new_price = price - self.grid_step
+                # 3) Cria BUY abaixo para manter o grid (próximo nível)
+                next_index = grid_index - 1
 
-                # Formata mensagem para o telegram
-                alert_msg = (
-                    f"📉 Próxima BUY prevista\n"
-                    f"Preço: {new_price:.2f}\n"
-                    f"Grid index: {grid_index - 1}"
-                )
+                if next_index < 0:
+                    self.logger.info(
+                        f"Limite inferior do GRID atingido no nível {grid_index}. "
+                        f"Não será criada BUY abaixo."
+                    )
+                    self.telegram_send(
+                        f"⚠️ Limite inferior do GRID atingido.\n"
+                        f"Grid index atual: {grid_index}"
+                    )
+                else:
+                    new_price = price - self.grid_step
 
-                self.logger.info(alert_msg)
-                self.telegram_send(alert_msg)
-                new_price = price - self.grid_step
-                self.place_order(new_price, "BUY", grid_index - 1)
+                    # Verifica se já existe BUY OPEN nesse nível
+                    self.cursor.execute("""
+                        SELECT id FROM active_grids
+                        WHERE grid_index=? AND side='BUY' AND status='OPEN'
+                    """, (next_index,))
+                    existing_buy = self.cursor.fetchone()
+
+                    if existing_buy:
+                        self.logger.info(f"BUY no nível {next_index} já existente. Nenhuma nova BUY criada.")
+                        self.telegram_send(f"ℹ️ BUY do grid {next_index} já está ativa.")
+                    else:
+                        self.logger.info(f"Criando BUY no nível {next_index}, preço {new_price:.2f}")
+                        self.telegram_send(
+                            f"📉 Próxima BUY criada\n"
+                            f"Preço: {new_price:.2f}\nGrid index: {next_index}"
+                        )
+                        self.place_order(new_price, "BUY", next_index)
 
     # --------------------------------------
     # SALDOS
