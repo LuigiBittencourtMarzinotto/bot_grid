@@ -295,39 +295,41 @@ class GridBot:
     # --------------------------------------
     def initialize_grid(self):
         """
-        - Primeiro, recupera grid perdido (retroativo)
-        - Depois, se não houver OPEN, cria um novo grid dinâmico
+        Cria apenas as próximas compras abaixo do preço atual (1 ou 2 níveis),
+        não cria o grid completo como antes.
         """
-        # Recupera ordens faltantes com base nas FILLED
+        # Recupera ordens faltantes
         self.recover_missing_orders()
 
-        # Verifica se já existem ordens OPEN
+        # Se já existe alguma ordem OPEN, não cria novas de início
         self.cursor.execute("SELECT count(*) FROM active_grids WHERE status='OPEN'")
         active_orders = self.cursor.fetchone()[0]
 
         if active_orders > 0:
-            self.logger.info(f"Reiniciando com {active_orders} ordens OPEN existentes. Não criará novo grid.")
-            self.telegram_send(f"Reiniciando com {active_orders} ordens OPEN existentes.")
+            self.logger.info("Reiniciando com ordens abertas — não criando novo grid completo.")
             return
 
-        # Nenhuma ordem open -> novo grid dinâmico
         ticker = self.exchange.fetch_ticker(self.SYMBOL)
         current_price = ticker['last']
 
-        # Recalcula grid em torno do preço atual
+        # calcula o grid dinâmico
         self.recalc_dynamic_grid(current_price)
 
-        grid_prices = self.calculate_grid_lines()
+        # cria APENAS a próxima BUY (não o grid inteiro)
+        next_buy_price = current_price - self.grid_step
 
-        self.telegram_send(f"🤖 GRID INICIADO\nPreço Atual: {current_price}")
+        # cria BUY apenas se houver espaço e saldo
+        self.place_order(next_buy_price, "BUY", 0)
 
-        for i, price in enumerate(grid_prices):
-            # Evita linha colada demais no preço atual
-            if abs(price - current_price) / current_price < 0.002:
-                continue
+        # OPCIONAL: criar segunda linha
+        second_buy_price = next_buy_price - self.grid_step
+        self.place_order(second_buy_price, "BUY", 1)
 
-            if price < current_price:
-                self.place_order(price, 'BUY', i)
+        self.telegram_send(
+            f"🟦 GRID COMPACTO INICIADO\n"
+            f"BUY1 = {next_buy_price:.2f}\n"
+            f"BUY2 = {second_buy_price:.2f}"
+        )
 
     # --------------------------------------
     # FUNÇÕES AUXILIARES DE ORDERS (REAL)
