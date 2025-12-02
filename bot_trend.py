@@ -43,7 +43,7 @@ class TrendBot:
         self.TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
         self.SIMULATION = os.getenv('MODO_SIMULACAO', 'true').lower() == 'true'
         
-        self.SYMBOL = os.getenv('SYMBOL', 'BTC/USDT')
+        self.SYMBOL = os.getenv('SYMBOL_TREND', 'BTC/USDT')
         self.TIMEFRAME = os.getenv('TREND_TIMEFRAME', '1h')
         self.RISK_PER_TRADE = float(os.getenv('TREND_RISK_PER_TRADE', 0.10))
         
@@ -207,7 +207,7 @@ class TrendBot:
         amount_final = self.exchange.amount_to_precision(self.SYMBOL, amount)
         price_final = self.exchange.price_to_precision(self.SYMBOL, price)
 
-        if float(amount_final) * float(price_final) < 10:
+        if float(amount_final) * float(price_final) < 5:
             self.logger.warning("Saldo insuficiente.")
             return
 
@@ -276,6 +276,7 @@ class TrendBot:
                     status = "COMPRADO" if state['in_position'] else "LIQUIDO"
                     trend_str = "ALTA" if curr['In_Uptrend'] else "BAIXA"
                     self.logger.info(f"[{status}] Preço: {price:.2f} | Tendência: {trend_str} | ADX: {curr['ADX']:.2f}")
+                    self.telegram_send(f"[{status}] Preço: {price:.2f} | Tendência: {trend_str} | ADX: {curr['ADX']:.2f}")
 
                 # --- MODO COMPRADO ---
                 if state['in_position']:
@@ -293,6 +294,7 @@ class TrendBot:
                     elif curr['SuperTrend'] > state['stop_loss']:
                         self.update_state(stop_loss=curr['SuperTrend'])
                         self.logger.info(f"🔒 Stop ajustado para linha SuperTrend: {curr['SuperTrend']:.2f}")
+                        self.telegram_send(f"🔒 Stop ajustado para linha SuperTrend: {curr['SuperTrend']:.2f}")
 
                 # --- MODO LÍQUIDO (Buscando Compra) ---
                 else:
