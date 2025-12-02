@@ -7,6 +7,8 @@ import os
 import sys
 from dotenv import load_dotenv
 from datetime import datetime
+from datetime import datetime, timedelta
+
 
 # ==========================================
 # CLASSE DE GERENCIAMENTO DO GRID V4
@@ -682,6 +684,59 @@ class GridBot:
             self.telegram_send(f"Erro ao obter saldo de {asset}: {e}")
             return 0.0
 
+    def cancel_old_open_orders(self, hours=24):
+        """
+        Cancela todas as ordens OPEN com mais de X horas.
+        - Cancela na Binance se for ordem real
+        - Remove da tabela active_grids
+        - Retorna True se houve cancelamento (para reconstrução do GRID)
+        """
+        self.cursor.execute("""
+            SELECT id, order_id, side, updated_at 
+            FROM active_grids 
+            WHERE status='OPEN'
+        """)
+        rows = self.cursor.fetchall()
+
+        if not rows:
+            return False
+
+        now = datetime.now()
+        expired = []
+
+        for row in rows:
+            _id, order_id, side, updated_at = row
+
+            # Converte timestamp salvo
+            updated_dt = datetime.fromisoformat(str(updated_at))
+
+            if now - updated_dt > timedelta(hours=hours):
+                expired.append((_id, order_id, side))
+
+        if not expired:
+            return False
+
+        self.logger.warning(f"{len(expired)} ordens OPEN expiradas ({hours}h). Cancelando...")
+        self.telegram_send(f"⚠️ {len(expired)} ordens travadas > {hours}h. Cancelando e reiniciando GRID...")
+
+        for _id, order_id, side in expired:
+            # 1. Tenta cancelar na Binance
+            if not self.SIMULATION:
+                try:
+                    self.exchange.cancel_order(order_id, self.SYMBOL)
+                    self.logger.info(f"Ordem REAL cancelada na Binance: {order_id}")
+                except Exception as e:
+                    self.logger.error(f"Erro ao cancelar ordem {order_id} na Binance: {e}")
+
+            # 2. Remove do SQLite
+            self.cursor.execute("DELETE FROM active_grids WHERE id=?", (_id,))
+            self.conn.commit()
+
+            self.logger.info(f"Ordem removida localmente: {order_id}")
+
+        return True
+
+
     # --------------------------------------
     # LOOP PRINCIPAL
     # --------------------------------------
@@ -692,7 +747,16 @@ class GridBot:
 
         while True:
             try:
+                # --- CANCELAMENTO AUTOMÁTICO POR TEMPO ---
+                if self.cancel_old_open_orders(hours=24):
+                    self.logger.info("Recriando GRID após cancelamento de ordens antigas...")
+                    self.initialize_grid()
+                    time.sleep(5)
+                    continue   # <<< mantém o bot rodando
+
+                # Lógica normal do grid
                 self.check_orders()
+
                 time.sleep(10)
             except Exception as e:
                 self.logger.error(f"Erro no loop principal: {e}")
