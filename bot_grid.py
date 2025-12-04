@@ -293,45 +293,92 @@ class GridBot:
                     self.place_order(new_price, "BUY", target_index)
 
     # --------------------------------------
-    # INICIALIZAÇÃO DO GRID
+    # INICIALIZAÇÃO DO GRID (COMPACTO POR SALDO)
     # --------------------------------------
     def initialize_grid(self):
         """
-        Cria apenas as próximas compras abaixo do preço atual (1 ou 2 níveis),
-        não cria o grid completo como antes.
+        Cria múltiplas BUY abaixo do preço atual conforme:
+        - saldo disponível
+        - limites do grid (0..GRID_LEVELS)
+        - sem duplicar ordens
+        - grid compacto (somente BUYs descendentes)
         """
         # Recupera ordens faltantes
         self.recover_missing_orders()
 
-        # Se já existe alguma ordem OPEN, não cria novas de início
+        # Se existem ordens OPEN, não recria grid
         self.cursor.execute("SELECT count(*) FROM active_grids WHERE status='OPEN'")
         active_orders = self.cursor.fetchone()[0]
 
         if active_orders > 0:
-            self.logger.info("Reiniciando com ordens abertas — não criando novo grid completo.")
+            self.logger.info("Reiniciando com ordens abertas — não criando novo grid.")
             return
 
+        # Obtém preço atual
         ticker = self.exchange.fetch_ticker(self.SYMBOL)
         current_price = ticker['last']
 
-        # calcula o grid dinâmico
+        # Recalcula grid dinâmico
         self.recalc_dynamic_grid(current_price)
 
-        # cria APENAS a próxima BUY (não o grid inteiro)
-        next_buy_price = current_price - self.grid_step
+        # Começar a colocar BUYs de forma compacta
+        next_price = current_price - self.grid_step
+        grid_index = 0
+        orders_created = 0
 
-        # cria BUY apenas se houver espaço e saldo
-        self.place_order(next_buy_price, "BUY", 0)
+        free_quote = self.get_free_balance(self.QUOTE_ASSET)
 
-        # OPCIONAL: criar segunda linha
-        second_buy_price = next_buy_price - self.grid_step
-        self.place_order(second_buy_price, "BUY", 1)
+        while True:
+            # Limite máximo de níveis
+            if grid_index > self.GRID_LEVELS:
+                break
+
+            # Preço da próxima BUY
+            if next_price <= 0:
+                break
+
+            # Custo estimado da BUY
+            amount_temp = self.INVESTMENT_PER_GRID / next_price
+            amount_temp = float(self.exchange.amount_to_precision(self.SYMBOL, amount_temp))
+            cost_est = amount_temp * next_price
+
+            # Se custo inválido, encerra
+            if amount_temp <= 0 or cost_est <= 0:
+                break
+
+            # Verifica saldo
+            if free_quote < cost_est:
+                self.logger.info(
+                    f"Saldo insuficiente para BUY {grid_index}; necessário {cost_est:.2f} {self.QUOTE_ASSET}, "
+                    f"disponível {free_quote:.2f}."
+                )
+                break
+
+            # Verifica se já existe BUY OPEN nesse nível
+            self.cursor.execute("""
+                SELECT id FROM active_grids
+                WHERE grid_index=? AND side='BUY' AND status='OPEN'
+            """, (grid_index,))
+            existing = self.cursor.fetchone()
+
+            if existing:
+                self.logger.info(f"BUY nível {grid_index} já existe. Não duplicando.")
+            else:
+                # Cria BUY real/simulada
+                self.place_order(next_price, "BUY", grid_index)
+                orders_created += 1
+                free_quote -= cost_est
+
+            # Próxima BUY mais abaixo
+            next_price -= self.grid_step
+            grid_index += 1
 
         self.telegram_send(
             f"🟦 GRID COMPACTO INICIADO\n"
-            f"BUY1 = {next_buy_price:.2f}\n"
-            f"BUY2 = {second_buy_price:.2f}"
+            f"Ordens BUY criadas: {orders_created}"
         )
+
+        self.logger.info(f"GRID compacto iniciado. BUYs criadas: {orders_created}")
 
     # --------------------------------------
     # FUNÇÕES AUXILIARES DE ORDERS (REAL)
