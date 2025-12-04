@@ -302,6 +302,7 @@ class GridBot:
         - limites do grid (0..GRID_LEVELS)
         - sem duplicar ordens
         - grid compacto (somente BUYs descendentes)
+        - reporta cada ordem criada (preço, qtd, custo, saldo restante)
         """
         # Recupera ordens faltantes
         self.recover_missing_orders()
@@ -326,35 +327,42 @@ class GridBot:
         grid_index = 0
         orders_created = 0
 
+        # Saldo inicial
         free_quote = self.get_free_balance(self.QUOTE_ASSET)
+        saldo_inicial = free_quote
+
+        self.logger.info(f"Saldo inicial: {free_quote:.2f} {self.QUOTE_ASSET}")
+        self.telegram_send(f"💰 Saldo inicial: {free_quote:.2f} {self.QUOTE_ASSET}")
 
         while True:
             # Limite máximo de níveis
             if grid_index > self.GRID_LEVELS:
                 break
 
-            # Preço da próxima BUY
             if next_price <= 0:
                 break
 
-            # Custo estimado da BUY
+            # Calcula quantidade e custo
             amount_temp = self.INVESTMENT_PER_GRID / next_price
             amount_temp = float(self.exchange.amount_to_precision(self.SYMBOL, amount_temp))
             cost_est = amount_temp * next_price
 
-            # Se custo inválido, encerra
             if amount_temp <= 0 or cost_est <= 0:
                 break
 
             # Verifica saldo
             if free_quote < cost_est:
                 self.logger.info(
-                    f"Saldo insuficiente para BUY {grid_index}; necessário {cost_est:.2f} {self.QUOTE_ASSET}, "
-                    f"disponível {free_quote:.2f}."
+                    f"Saldo insuficiente para BUY {grid_index}; necessário {cost_est:.2f}, disponível {free_quote:.2f}"
+                )
+                self.telegram_send(
+                    f"⚠️ BUY nível {grid_index} não criada\n"
+                    f"Necessário: {cost_est:.2f} {self.QUOTE_ASSET}\n"
+                    f"Disponível: {free_quote:.2f}"
                 )
                 break
 
-            # Verifica se já existe BUY OPEN nesse nível
+            # Verifica duplicados
             self.cursor.execute("""
                 SELECT id FROM active_grids
                 WHERE grid_index=? AND side='BUY' AND status='OPEN'
@@ -362,23 +370,38 @@ class GridBot:
             existing = self.cursor.fetchone()
 
             if existing:
-                self.logger.info(f"BUY nível {grid_index} já existe. Não duplicando.")
+                self.logger.info(f"BUY nível {grid_index} já existe. Ignorando.")
             else:
-                # Cria BUY real/simulada
+                # Criação real / simulada
                 self.place_order(next_price, "BUY", grid_index)
-                orders_created += 1
+
                 free_quote -= cost_est
+                orders_created += 1
+
+                msg = (
+                    f"🟦 BUY criada nível {grid_index}\n"
+                    f"Preço: {next_price:.2f}\n"
+                    f"Qtd: {amount_temp:.6f}\n"
+                    f"Custo: {cost_est:.2f} {self.QUOTE_ASSET}\n"
+                    f"Saldo restante: {free_quote:.2f} {self.QUOTE_ASSET}"
+                )
+
+                self.logger.info(msg.replace("\n", " | "))
+                self.telegram_send(msg)
 
             # Próxima BUY mais abaixo
             next_price -= self.grid_step
             grid_index += 1
 
-        self.telegram_send(
+        resumo = (
             f"🟦 GRID COMPACTO INICIADO\n"
-            f"Ordens BUY criadas: {orders_created}"
+            f"Ordens BUY criadas: {orders_created}\n"
+            f"Saldo inicial: {saldo_inicial:.2f} {self.QUOTE_ASSET}\n"
+            f"Saldo final: {free_quote:.2f} {self.QUOTE_ASSET}"
         )
 
-        self.logger.info(f"GRID compacto iniciado. BUYs criadas: {orders_created}")
+        self.telegram_send(resumo)
+        self.logger.info(resumo.replace("\n", " | "))
 
     # --------------------------------------
     # FUNÇÕES AUXILIARES DE ORDERS (REAL)
