@@ -795,7 +795,7 @@ class GridBot:
         while True:
             try:
                 # --- CANCELAMENTO AUTOMÁTICO POR TEMPO ---
-                if self.cancel_old_open_orders(hours=12):
+                if self.cancel_old_open_orders(hours=4):
                     self.logger.info("Recriando GRID após cancelamento de ordens antigas...")
                     self.initialize_grid()
                     time.sleep(5)
