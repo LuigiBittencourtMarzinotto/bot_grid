@@ -722,7 +722,9 @@ class GridBot:
                         f"Grid index atual: {grid_index}"
                     )
                 else:
-                    new_price = price - self.grid_step
+                    ticker = self.exchange.fetch_ticker(self.SYMBOL)
+                    current_price = ticker['last']
+                    new_price = current_price - self.grid_step
 
                     # Verifica se já existe BUY OPEN nesse nível
                     self.cursor.execute("""
@@ -818,7 +820,7 @@ class GridBot:
         while True:
             try:
                 # --- CANCELAMENTO AUTOMÁTICO POR TEMPO ---
-                if self.cancel_old_open_orders(hours=4):
+                if self.cancel_old_open_orders(hours=12):
                     self.logger.info("Recriando GRID após cancelamento de ordens antigas...")
                     self.initialize_grid()
                     time.sleep(5)
