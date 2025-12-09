@@ -325,7 +325,7 @@ class GridBot:
         current_price = ticker['last']
 
         # Recalcula grid dinâmico
-        self.recalc_dynamic_grid(current_price)
+        # self.recalc_dynamic_grid(current_price)
 
         # Começar a colocar BUYs de forma compacta
         next_price = current_price - self.BUY_OFFSET
