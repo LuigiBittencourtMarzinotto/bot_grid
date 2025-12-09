@@ -43,7 +43,6 @@ class GridBot:
     # CONFIG / ENV
     # --------------------------------------
     def _load_config(self):
-        # Força carregar .env no mesmo diretório
         load_dotenv(dotenv_path='.env', override=True)
 
         self.API_KEY = os.getenv('BINANCE_API_KEY')
@@ -51,39 +50,39 @@ class GridBot:
         self.TG_TOKEN = os.getenv('TELEGRAM_TOKEN')
         self.TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-        # Default agora é 'false'
         self.SIMULATION = str(os.getenv('MODO_SIMULACAO', 'false')).lower() == 'true'
 
-        # Configurações do Grid (base)
-        self.SYMBOL = os.getenv('SYMBOL', 'BTC/USDT')
+        # --------- CONFIGURAÇÕES ESPECÍFICAS ADA ----------
+        self.SYMBOL = os.getenv('ADA_SYMBOL', 'ADA/USDT')
 
-        # Range base vindo do .env (usado para grid dinâmico)
-        self.BASE_LOWER_PRICE = float(os.getenv('GRID_LOWER_PRICE', 50000))
-        self.BASE_UPPER_PRICE = float(os.getenv('GRID_UPPER_PRICE', 70000))
-        self.GRID_LEVELS = int(os.getenv('GRID_LEVELS', 10))
-        self.INVESTMENT_PER_GRID = float(os.getenv('AMOUNT_PER_GRID_USDT', 15))
+        self.BUY_OFFSET = float(os.getenv('ADA_BUY_OFFSET', 0.01))
+        self.SELL_OFFSET = float(os.getenv('ADA_SELL_OFFSET', 0.02))
+        self.ADA_MAX_USD = float(os.getenv("ADA_MAX_USD", 9))
 
-        # Range e step derivados
+        self.BASE_LOWER_PRICE = float(os.getenv('ADA_GRID_LOWER', 0.30))
+        self.BASE_UPPER_PRICE = float(os.getenv('ADA_GRID_UPPER', 0.80))
+        self.GRID_LEVELS = int(os.getenv('ADA_GRID_LEVELS', 30))
+        self.INVESTMENT_PER_GRID = float(os.getenv('ADA_AMOUNT_PER_GRID', 0.30))
+
+        # RANGE
         self.RANGE_SIZE = self.BASE_UPPER_PRICE - self.BASE_LOWER_PRICE
         if self.RANGE_SIZE <= 0:
-            raise ValueError("GRID_UPPER_PRICE deve ser MAIOR que GRID_LOWER_PRICE no .env")
+            raise ValueError("ADA_GRID_UPPER deve ser MAIOR que ADA_GRID_LOWER no .env")
 
         self.grid_step = self.RANGE_SIZE / self.GRID_LEVELS
 
-        # Valores que podem ser recalculados dinamicamente (grid dinâmico)
         self.LOWER_PRICE = self.BASE_LOWER_PRICE
         self.UPPER_PRICE = self.BASE_UPPER_PRICE
 
-        # Criar conexão global SQLite
-        self.DB_NAME = "grid_data.db"
+        self.DB_NAME = "grid_data_ada.db"
         self.conn = sqlite3.connect(self.DB_NAME, timeout=15, check_same_thread=False)
         self.cursor = self.conn.cursor()
 
-        # Base e quote do par (ex: BTC / USDT)
+        # BASE e QUOTE da ADA
         try:
             self.BASE_ASSET, self.QUOTE_ASSET = self.SYMBOL.split('/')
         except ValueError:
-            self.logger.error(f"Símbolo inválido: {self.SYMBOL}. Esperado formato BASE/QUOTE (ex: BTC/USDT).")
+            self.logger.error(f"Símbolo inválido: {self.SYMBOL}. Esperado formato BASE/QUOTE.")
             sys.exit(1)
 
     # --------------------------------------
@@ -198,6 +197,7 @@ class GridBot:
         try:
             token = self.TG_TOKEN
             chat_id = self.TG_CHAT_ID
+            message = f"ADA CRIPTO {message}"
             if not token or not chat_id:
                 return
             url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -302,7 +302,7 @@ class GridBot:
         - limites do grid (0..GRID_LEVELS)
         - sem duplicar ordens
         - grid compacto (somente BUYs descendentes)
-        - reporta cada ordem criada (preço, qtd, custo, saldo restante)
+        - respeitando limite máximo de exposição BTC em USD (ADA_MAX_USD)
         """
         # Recupera ordens faltantes
         self.recover_missing_orders()
@@ -323,7 +323,8 @@ class GridBot:
         self.recalc_dynamic_grid(current_price)
 
         # Começar a colocar BUYs de forma compacta
-        next_price = current_price - self.grid_step
+        next_price = current_price - self.BUY_OFFSET
+
         grid_index = 0
         orders_created = 0
 
@@ -342,6 +343,22 @@ class GridBot:
             if next_price <= 0:
                 break
 
+            # ===============================
+            # 🔒 TRAVA DE EXPOSIÇÃO EM BTC
+            # ===============================
+            exposure_usd = self.get_total_asset_exposure_usd(current_price)
+            new_buy_value = self.INVESTMENT_PER_GRID  # valor em USDT que será convertido em BTC
+
+            if exposure_usd + new_buy_value > self.ADA_MAX_USD:
+                msg = (
+                    f"⛔ Limite BTC atingido ({exposure_usd:.2f} USD). "
+                    f"BUYs adicionais bloqueadas para evitar ultrapassar {self.ADA_MAX_USD} USD."
+                )
+                self.logger.warning(msg)
+                self.telegram_send(msg)
+                break
+            # ===============================
+
             # Calcula quantidade e custo
             amount_temp = self.INVESTMENT_PER_GRID / next_price
             amount_temp = float(self.exchange.amount_to_precision(self.SYMBOL, amount_temp))
@@ -350,7 +367,7 @@ class GridBot:
             if amount_temp <= 0 or cost_est <= 0:
                 break
 
-            # Verifica saldo
+            # Verifica saldo em USDT
             if free_quote < cost_est:
                 self.logger.info(
                     f"Saldo insuficiente para BUY {grid_index}; necessário {cost_est:.2f}, disponível {free_quote:.2f}"
@@ -473,6 +490,23 @@ class GridBot:
 
         # SALDO
         if side == 'BUY':
+            # --- Travamento de risco: não ultrapassar ADA_MAX_USD ---
+            ticker = self.exchange.fetch_ticker(self.SYMBOL)
+            current_price = ticker['last']
+            exposure_usd = self.get_total_asset_exposure_usd(current_price)
+            new_buy_value = cost  # custo desta compra
+
+            if exposure_usd + new_buy_value > self.ADA_MAX_USD:
+                msg = (
+                    f"⛔ BUY bloqueada: Exposição BTC atingiu limite de {self.ADA_MAX_USD} USD.\n"
+                    f"Exposição atual: {exposure_usd:.2f} USD\n"
+                    f"Compra tentaria elevar para: {exposure_usd + new_buy_value:.2f} USD"
+                )
+                self.logger.warning(msg)
+                self.telegram_send(msg)
+                return
+
+            # --- Verificação normal de saldo USDT ---
             free_quote = self.get_free_balance(self.QUOTE_ASSET)
             if free_quote < cost:
                 msg = (
@@ -482,6 +516,7 @@ class GridBot:
                 self.logger.warning(msg)
                 self.telegram_send(msg)
                 return
+
         else:  # SELL
             free_base = self.get_free_balance(self.BASE_ASSET)
             if free_base < amount_final:
@@ -606,7 +641,7 @@ class GridBot:
                         f"Grid index atual: {grid_index}"
                     )
                 else:
-                    new_price = price + self.grid_step
+                    new_price = price + self.SELL_OFFSET
 
                     # Verifica se já existe SELL OPEN nesse nível
                     self.cursor.execute("""
@@ -755,6 +790,39 @@ class GridBot:
             self.logger.error(f"Erro ao obter saldo de {asset}: {e}")
             self.telegram_send(f"Erro ao obter saldo de {asset}: {e}")
             return 0.0
+
+    def get_total_asset_exposure_usd(self, current_price):
+        """
+        Soma:
+        - ADA livre na conta
+        - ADA em BUYs FILLED sem SELL ainda
+        - ADA em BUYs OPEN (reservado)
+        Converte tudo para USD usando o preço atual.
+        """
+        total_asset = 0.0
+
+        # 1. ADA livre
+        free_asset = self.get_free_balance(self.BASE_ASSET)
+        total_asset += free_asset
+
+        # 2. ADA em BUYs OPEN
+        self.cursor.execute("""
+            SELECT amount FROM active_grids WHERE side='BUY' AND status='OPEN'
+        """)
+        rows = self.cursor.fetchall()
+        for r in rows:
+            total_asset += float(r[0])
+
+        # 3. ADA em BUYs FILLED sem vender
+        self.cursor.execute("""
+            SELECT amount FROM filled_orders
+            WHERE side='BUY' AND used_in_cycle=0
+        """)
+        rows = self.cursor.fetchall()
+        for r in rows:
+            total_asset += float(r[0])
+
+        return total_asset * current_price
 
     def cancel_old_open_orders(self, hours=24):
         """
