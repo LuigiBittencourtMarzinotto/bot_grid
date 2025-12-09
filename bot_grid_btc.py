@@ -202,6 +202,7 @@ class GridBot:
         try:
             token = self.TG_TOKEN
             chat_id = self.TG_CHAT_ID
+            message = f"BTC CRIPTO  {message}"
             if not token or not chat_id:
                 return
             url = f"https://api.telegram.org/bot{token}/sendMessage"
