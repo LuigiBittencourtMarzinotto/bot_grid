@@ -302,7 +302,7 @@ class GridBot:
         - limites do grid (0..GRID_LEVELS)
         - sem duplicar ordens
         - grid compacto (somente BUYs descendentes)
-        - respeitando limite máximo de exposição BTC em USD (ADA_MAX_USD)
+        - respeitando limite máximo de exposição ADA em USD (ADA_MAX_USD)
         """
         # Recupera ordens faltantes
         self.recover_missing_orders()
@@ -344,14 +344,14 @@ class GridBot:
                 break
 
             # ===============================
-            # 🔒 TRAVA DE EXPOSIÇÃO EM BTC
+            # 🔒 TRAVA DE EXPOSIÇÃO EM ADA
             # ===============================
             exposure_usd = self.get_total_asset_exposure_usd(current_price)
-            new_buy_value = self.INVESTMENT_PER_GRID  # valor em USDT que será convertido em BTC
+            new_buy_value = self.INVESTMENT_PER_GRID  # valor em USDT que será convertido em ADA
 
             if exposure_usd + new_buy_value > self.ADA_MAX_USD:
                 msg = (
-                    f"⛔ Limite BTC atingido ({exposure_usd:.2f} USD). "
+                    f"⛔ Limite ADA atingido ({exposure_usd:.2f} USD). "
                     f"BUYs adicionais bloqueadas para evitar ultrapassar {self.ADA_MAX_USD} USD."
                 )
                 self.logger.warning(msg)
@@ -474,7 +474,7 @@ class GridBot:
         """
         Cria ordem REAL ou SIMULADA + grava no SQLite.
         - BUY -> checa saldo da quote (USDT)
-        - SELL -> checa saldo da base (BTC)
+        - SELL -> checa saldo da base (ADA)
         """
         amount_base = self.INVESTMENT_PER_GRID / price
 
@@ -498,7 +498,7 @@ class GridBot:
 
             if exposure_usd + new_buy_value > self.ADA_MAX_USD:
                 msg = (
-                    f"⛔ BUY bloqueada: Exposição BTC atingiu limite de {self.ADA_MAX_USD} USD.\n"
+                    f"⛔ BUY bloqueada: Exposição ADA atingiu limite de {self.ADA_MAX_USD} USD.\n"
                     f"Exposição atual: {exposure_usd:.2f} USD\n"
                     f"Compra tentaria elevar para: {exposure_usd + new_buy_value:.2f} USD"
                 )
