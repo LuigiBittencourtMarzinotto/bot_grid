@@ -685,32 +685,23 @@ class GridBot:
                 else:
                     new_price = price + self.SELL_OFFSET
 
-                    # Respeita UPPER_PRICE
-                    if new_price > self.UPPER_PRICE:
-                        self.logger.info(
-                            f"SELL do grid {next_index} não criada. Preço {new_price:.2f} acima do UPPER {self.UPPER_PRICE:.2f}"
-                        )
-                        self.telegram_send(
-                            f"⛔ SELL não criada\nPreço {new_price:.2f} acima do UPPER {self.UPPER_PRICE:.2f}"
-                        )
-                    else:
-                        # Verifica se já existe SELL OPEN nesse nível
-                        self.cursor.execute("""
-                            SELECT id FROM active_grids
-                            WHERE grid_index=? AND side='SELL' AND status='OPEN'
-                        """, (next_index,))
-                        existing_sell = self.cursor.fetchone()
+                    # Verifica se já existe SELL OPEN nesse nível
+                    self.cursor.execute("""
+                        SELECT id FROM active_grids
+                        WHERE grid_index=? AND side='SELL' AND status='OPEN'
+                    """, (next_index,))
+                    existing_sell = self.cursor.fetchone()
 
-                        if existing_sell:
-                            self.logger.info(f"SELL no nível {next_index} já existente. Nenhuma nova SELL criada.")
-                            self.telegram_send(f"ℹ️ SELL do grid {next_index} já está ativa.")
-                        else:
-                            self.logger.info(f"Criando SELL no nível {next_index}, preço {new_price:.2f}")
-                            self.telegram_send(
-                                f"📈 Próxima SELL criada\n"
-                                f"Preço: {new_price:.2f}\nGrid index: {next_index}"
-                            )
-                            self.place_order(new_price, "SELL", next_index)
+                    if existing_sell:
+                        self.logger.info(f"SELL no nível {next_index} já existente. Nenhuma nova SELL criada.")
+                        self.telegram_send(f"ℹ️ SELL do grid {next_index} já está ativa.")
+                    else:
+                        self.logger.info(f"Criando SELL no nível {next_index}, preço {new_price:.2f}")
+                        self.telegram_send(
+                            f"📈 Próxima SELL criada\n"
+                            f"Preço: {new_price:.2f}\nGrid index: {next_index}"
+                        )
+                        self.place_order(new_price, "SELL", next_index)
 
             else:  # SELL
                 # 1) Lucro aproximado (bruto, compatibilidade antiga)
