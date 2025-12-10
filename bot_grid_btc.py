@@ -547,10 +547,40 @@ class GridBot:
 
         # Se não há nenhuma ordem OPEN, reconstruir GRID
         if not open_orders:
+            # Verifica saldo mínimo
+            ok, free_quote, min_needed = self._has_minimum_quote_balance()
+
+            if not ok:
+                # Se já estava pausado, NÃO ENVIAR MENSAGEM novamente
+                if not self.grid_paused_low_balance:
+                    self.grid_paused_low_balance = True
+                    msg = (
+                        f"⚠️ GRID pausado por saldo insuficiente.\n"
+                        f"Necessário: {min_needed:.2f} {self.QUOTE_ASSET}\n"
+                        f"Disponível: {free_quote:.2f} {self.QUOTE_ASSET}"
+                    )
+                    self.logger.warning(msg.replace("\n", " | "))
+                    self.telegram_send(msg)
+
+                # Não tenta recriar grid enquanto não houver saldo
+                return
+
+            # Se agora tem saldo — destrava
+            if self.grid_paused_low_balance:
+                self.grid_paused_low_balance = False
+                msg = (
+                    f"✅ Saldo suficiente detectado. GRID será reativado.\n"
+                    f"Saldo atual: {free_quote:.2f} {self.QUOTE_ASSET}"
+                )
+                self.logger.info(msg.replace("\n", " | "))
+                self.telegram_send(msg)
+
+            # Agora sim recria o grid
             self.logger.warning("Nenhuma ordem OPEN ativa. Reconstruindo GRID automaticamente.")
             self.telegram_send("⚠️ Nenhuma ordem OPEN ativa. GRID será reconstruído.")
             self.initialize_grid()
             return
+
 
         ticker = self.exchange.fetch_ticker(self.SYMBOL)
         curr = ticker['last']
