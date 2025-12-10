@@ -509,7 +509,7 @@ class GridBot:
         - SEMPRE respeita LOWER_PRICE / UPPER_PRICE
         """
         # TRAVA GLOBAL DE FAIXA
-        if price > self.UPPER_PRICE or price < self.LOWER_PRICE:
+        if  side == 'BUY' and price > self.UPPER_PRICE or price < self.LOWER_PRICE :
             msg = (
                 f"⛔ Ordem {side} bloqueada: preço {price:.2f} fora da faixa "
                 f"[{self.LOWER_PRICE:.2f}, {self.UPPER_PRICE:.2f}]"
