@@ -23,6 +23,7 @@ class GridBot:
         self.telegram_send("🚀 GRID V4 iniciado (lucro real habilitado).")
         self.logger.info(f"SIMULATION = {self.SIMULATION}")
         self.telegram_send(f"SIMULATION = {self.SIMULATION}")
+        # Flag para pausar reconstrução de grid quando não há saldo
         self.grid_paused_low_balance = False
 
     # --------------------------------------
@@ -243,8 +244,6 @@ class GridBot:
         Ao reiniciar o bot, verifica ordens FILLED e recria a contraparte que faltar.
         - BUY FILLED sem SELL -> cria SELL (BUY -> SELL)
         - SELL FILLED sem BUY -> cria BUY (SELL -> BUY)
-        Respeitando limites de grid_index (0..GRID_LEVELS).
-        E respeitando LOWER_PRICE / UPPER_PRICE no preço das ordens recriadas.
         """
         self.cursor.execute("SELECT id, grid_index, order_id, price, side, amount, status FROM active_grids")
         rows = self.cursor.fetchall()
@@ -313,6 +312,20 @@ class GridBot:
                     self.place_order(new_price, "BUY", target_index)
 
     # --------------------------------------
+    # MÍNIMO DE SALDO
+    # --------------------------------------
+    def _has_minimum_quote_balance(self):
+        """
+        Verifica se há saldo mínimo de quote (USDT) para montar o grid.
+        Usa o maior valor entre:
+        - INVESTMENT_PER_GRID
+        - min_cost da Binance para o par
+        """
+        free_quote = self.get_free_balance(self.QUOTE_ASSET)
+        min_needed = max(self.INVESTMENT_PER_GRID, self.min_cost or 0)
+        return free_quote >= min_needed, free_quote, min_needed
+
+    # --------------------------------------
     # INICIALIZAÇÃO DO GRID (COMPACTO POR SALDO)
     # --------------------------------------
     def initialize_grid(self):
@@ -336,7 +349,7 @@ class GridBot:
             self.logger.info("Reiniciando com ordens abertas — não criando novo grid.")
             return
 
-        # *** NOVO: não tenta montar grid se não tiver saldo mínimo ***
+        # Não tenta montar grid se não tiver saldo mínimo
         ok, free_quote, min_needed = self._has_minimum_quote_balance()
         if not ok:
             msg = (
@@ -348,7 +361,6 @@ class GridBot:
             self.logger.warning(msg.replace("\n", " | "))
             self.telegram_send(msg)
             return
-        # *** FIM NOVO ***
 
         # Obtém preço atual
         ticker = self.exchange.fetch_ticker(self.SYMBOL)
@@ -359,10 +371,29 @@ class GridBot:
             f"LOWER={self.LOWER_PRICE:.2f}, UPPER={self.UPPER_PRICE:.2f}"
         )
 
-        # Primeiro preço de BUY: abaixo do preço atual, mas nunca acima do UPPER
-        next_price = current_price - self.BUY_OFFSET
-        if next_price > self.UPPER_PRICE:
-            next_price = self.UPPER_PRICE
+        # ================================
+        # NOVA LÓGICA DE PRECIFICAÇÃO BUY
+        # ================================
+        if current_price > self.UPPER_PRICE:
+            # Preço acima da faixa → usar limite superior - offset
+            next_price = self.UPPER_PRICE - self.BUY_OFFSET
+            self.logger.info(f"Preço atual acima do UPPER. PRIMEIRA BUY ajustada para {next_price:.2f}")
+        else:
+            # Dentro da faixa → offset normal
+            next_price = current_price - self.BUY_OFFSET
+            # Garantia de não ultrapassar o UPPER
+            if next_price > self.UPPER_PRICE:
+                next_price = self.UPPER_PRICE
+
+        # Se abaixo do LOWER, não cria grid
+        if next_price < self.LOWER_PRICE:
+            msg = (
+                f"⚠️ next_price ({next_price:.2f}) ficou abaixo do LOWER ({self.LOWER_PRICE:.2f}). "
+                f"Nenhuma BUY será criada."
+            )
+            self.logger.warning(msg.replace("\n", " | "))
+            self.telegram_send(msg)
+            return
 
         grid_index = 0
         orders_created = 0
@@ -371,7 +402,96 @@ class GridBot:
 
         self.logger.info(f"Saldo inicial: {free_quote:.2f} {self.QUOTE_ASSET}")
         self.telegram_send(f"💰 Saldo inicial: {free_quote:.2f} {self.QUOTE_ASSET}")
-        ...
+
+        # Loop de criação de BUYs descendentes
+        while True:
+            # Limite máximo de níveis
+            if grid_index > self.GRID_LEVELS:
+                break
+
+            if next_price <= 0:
+                break
+
+            # Se o próximo preço já caiu abaixo do LOWER, paramos o grid
+            if next_price < self.LOWER_PRICE:
+                self.logger.info(
+                    f"Parando criação de BUY: next_price {next_price:.2f} abaixo do LOWER {self.LOWER_PRICE:.2f}"
+                )
+                break
+
+            # Trava de exposição em BTC
+            exposure_usd = self.get_total_btc_exposure_usd(current_price)
+            new_buy_value = self.INVESTMENT_PER_GRID  # valor em USDT que será convertido em BTC
+
+            if exposure_usd + new_buy_value > self.MAX_BTC_USD:
+                msg = (
+                    f"⛔ Limite BTC atingido ({exposure_usd:.2f} USD). "
+                    f"BUYs adicionais bloqueadas para evitar ultrapassar {self.MAX_BTC_USD} USD."
+                )
+                self.logger.warning(msg)
+                self.telegram_send(msg)
+                break
+
+            # Calcula quantidade e custo
+            amount_temp = self.INVESTMENT_PER_GRID / next_price
+            amount_temp = float(self.exchange.amount_to_precision(self.SYMBOL, amount_temp))
+            cost_est = amount_temp * next_price
+
+            if amount_temp <= 0 or cost_est <= 0:
+                break
+
+            # Verifica saldo em USDT
+            if free_quote < cost_est:
+                self.logger.info(
+                    f"Saldo insuficiente para BUY {grid_index}; necessário {cost_est:.2f}, disponível {free_quote:.2f}"
+                )
+                self.telegram_send(
+                    f"⚠️ BUY nível {grid_index} não criada\n"
+                    f"Necessário: {cost_est:.2f} {self.QUOTE_ASSET}\n"
+                    f"Disponível: {free_quote:.2f}"
+                )
+                break
+
+            # Verifica duplicados
+            self.cursor.execute("""
+                SELECT id FROM active_grids
+                WHERE grid_index=? AND side='BUY' AND status='OPEN'
+            """, (grid_index,))
+            existing = self.cursor.fetchone()
+
+            if existing:
+                self.logger.info(f"BUY nível {grid_index} já existe. Ignorando.")
+            else:
+                # Criação real / simulada
+                self.place_order(next_price, "BUY", grid_index)
+
+                free_quote -= cost_est
+                orders_created += 1
+
+                msg = (
+                    f"🟦 BUY criada nível {grid_index}\n"
+                    f"Preço: {next_price:.2f}\n"
+                    f"Qtd: {amount_temp:.6f}\n"
+                    f"Custo: {cost_est:.2f} {self.QUOTE_ASSET}\n"
+                    f"Saldo restante: {free_quote:.2f} {self.QUOTE_ASSET}"
+                )
+
+                self.logger.info(msg.replace("\n", " | "))
+                self.telegram_send(msg)
+
+            # Próxima BUY mais abaixo
+            next_price -= self.grid_step
+            grid_index += 1
+
+        resumo = (
+            f"🟦 GRID COMPACTO INICIADO\n"
+            f"Ordens BUY criadas: {orders_created}\n"
+            f"Saldo inicial: {saldo_inicial:.2f} {self.QUOTE_ASSET}\n"
+            f"Saldo final: {free_quote:.2f} {self.QUOTE_ASSET}"
+        )
+
+        self.telegram_send(resumo)
+        self.logger.info(resumo.replace("\n", " | "))
 
     # --------------------------------------
     # FUNÇÕES AUXILIARES DE ORDERS (REAL)
@@ -420,19 +540,6 @@ class GridBot:
 
         return avg_price, filled, fee_cost, fee_currency
 
-    def _has_minimum_quote_balance(self):
-        """
-        Verifica se há saldo mínimo de quote (USDT) para montar o grid.
-        Usa o maior valor entre:
-        - INVESTMENT_PER_GRID
-        - min_cost da Binance para o par
-        """
-        free_quote = self.get_free_balance(self.QUOTE_ASSET)
-        min_needed = max(self.INVESTMENT_PER_GRID, self.min_cost or 0)
-
-        return free_quote >= min_needed, free_quote, min_needed
-
-
     # --------------------------------------
     # ORDENS
     # --------------------------------------
@@ -444,7 +551,7 @@ class GridBot:
         - SEMPRE respeita LOWER_PRICE / UPPER_PRICE
         """
         # TRAVA GLOBAL DE FAIXA
-        if  side == 'BUY' and price > self.UPPER_PRICE or price < self.LOWER_PRICE :
+        if side == 'BUY' and price > self.UPPER_PRICE or price < self.LOWER_PRICE:
             msg = (
                 f"⛔ Ordem {side} bloqueada: preço {price:.2f} fora da faixa "
                 f"[{self.LOWER_PRICE:.2f}, {self.UPPER_PRICE:.2f}]"
@@ -581,7 +688,6 @@ class GridBot:
             self.telegram_send("⚠️ Nenhuma ordem OPEN ativa. GRID será reconstruído.")
             self.initialize_grid()
             return
-
 
         ticker = self.exchange.fetch_ticker(self.SYMBOL)
         curr = ticker['last']
@@ -842,13 +948,10 @@ class GridBot:
     def cancel_old_open_orders(self, hours=24):
         """
         Cancela todas as ordens OPEN com mais de X horas.
-        - Cancela na Binance se for ordem real
-        - Remove da tabela active_grids
-        - Retorna True se houve cancelamento (para reconstrução do GRID)
         """
         self.cursor.execute("""
-            SELECT id, order_id, side, updated_at 
-            FROM active_grids 
+            SELECT id, order_id, side, updated_at
+            FROM active_grids
             WHERE status='OPEN'
         """)
         rows = self.cursor.fetchall()
@@ -861,8 +964,6 @@ class GridBot:
 
         for row in rows:
             _id, order_id, side, updated_at = row
-
-            # Converte timestamp salvo
             updated_dt = datetime.fromisoformat(str(updated_at))
 
             if now - updated_dt > timedelta(hours=hours):
@@ -901,12 +1002,12 @@ class GridBot:
 
         while True:
             try:
-                # --- CANCELAMENTO AUTOMÁTICO POR TEMPO ---
+                # CANCELAMENTO AUTOMÁTICO POR TEMPO
                 if self.cancel_old_open_orders(hours=12):
                     self.logger.info("Recriando GRID após cancelamento de ordens antigas...")
                     self.initialize_grid()
                     time.sleep(5)
-                    continue   # mantém o bot rodando
+                    continue
 
                 # Lógica normal do grid
                 self.check_orders()
