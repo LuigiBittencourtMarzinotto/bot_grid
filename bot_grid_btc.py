@@ -23,6 +23,7 @@ class GridBot:
         self.telegram_send("🚀 GRID V4 iniciado (lucro real habilitado).")
         self.logger.info(f"SIMULATION = {self.SIMULATION}")
         self.telegram_send(f"SIMULATION = {self.SIMULATION}")
+        self.grid_paused_low_balance = False
 
     # --------------------------------------
     # LOGGING
