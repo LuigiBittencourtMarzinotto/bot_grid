@@ -335,6 +335,20 @@ class GridBot:
             self.logger.info("Reiniciando com ordens abertas — não criando novo grid.")
             return
 
+        # *** NOVO: não tenta montar grid se não tiver saldo mínimo ***
+        ok, free_quote, min_needed = self._has_minimum_quote_balance()
+        if not ok:
+            msg = (
+                f"⚠️ Saldo insuficiente para iniciar GRID.\n"
+                f"Necessário pelo menos: {min_needed:.2f} {self.QUOTE_ASSET}\n"
+                f"Disponível: {free_quote:.2f} {self.QUOTE_ASSET}\n"
+                f"Ajuste AMOUNT_PER_GRID_USDT ou deposite mais {self.QUOTE_ASSET}."
+            )
+            self.logger.warning(msg.replace("\n", " | "))
+            self.telegram_send(msg)
+            return
+        # *** FIM NOVO ***
+
         # Obtém preço atual
         ticker = self.exchange.fetch_ticker(self.SYMBOL)
         current_price = ticker['last']
@@ -352,104 +366,11 @@ class GridBot:
         grid_index = 0
         orders_created = 0
 
-        # Saldo inicial
-        free_quote = self.get_free_balance(self.QUOTE_ASSET)
         saldo_inicial = free_quote
 
         self.logger.info(f"Saldo inicial: {free_quote:.2f} {self.QUOTE_ASSET}")
         self.telegram_send(f"💰 Saldo inicial: {free_quote:.2f} {self.QUOTE_ASSET}")
-
-        while True:
-            # Limite máximo de níveis
-            if grid_index > self.GRID_LEVELS:
-                break
-
-            if next_price <= 0:
-                break
-
-            # Se o próximo preço já caiu abaixo do LOWER, paramos o grid
-            if next_price < self.LOWER_PRICE:
-                self.logger.info(
-                    f"Parando criação de BUY: next_price {next_price:.2f} abaixo do LOWER {self.LOWER_PRICE:.2f}"
-                )
-                break
-
-            # ===============================
-            # 🔒 TRAVA DE EXPOSIÇÃO EM BTC
-            # ===============================
-            exposure_usd = self.get_total_btc_exposure_usd(current_price)
-            new_buy_value = self.INVESTMENT_PER_GRID  # valor em USDT que será convertido em BTC
-
-            if exposure_usd + new_buy_value > self.MAX_BTC_USD:
-                msg = (
-                    f"⛔ Limite BTC atingido ({exposure_usd:.2f} USD). "
-                    f"BUYs adicionais bloqueadas para evitar ultrapassar {self.MAX_BTC_USD} USD."
-                )
-                self.logger.warning(msg)
-                self.telegram_send(msg)
-                break
-            # ===============================
-
-            # Calcula quantidade e custo
-            amount_temp = self.INVESTMENT_PER_GRID / next_price
-            amount_temp = float(self.exchange.amount_to_precision(self.SYMBOL, amount_temp))
-            cost_est = amount_temp * next_price
-
-            if amount_temp <= 0 or cost_est <= 0:
-                break
-
-            # Verifica saldo em USDT
-            if free_quote < cost_est:
-                self.logger.info(
-                    f"Saldo insuficiente para BUY {grid_index}; necessário {cost_est:.2f}, disponível {free_quote:.2f}"
-                )
-                self.telegram_send(
-                    f"⚠️ BUY nível {grid_index} não criada\n"
-                    f"Necessário: {cost_est:.2f} {self.QUOTE_ASSET}\n"
-                    f"Disponível: {free_quote:.2f}"
-                )
-                break
-
-            # Verifica duplicados
-            self.cursor.execute("""
-                SELECT id FROM active_grids
-                WHERE grid_index=? AND side='BUY' AND status='OPEN'
-            """, (grid_index,))
-            existing = self.cursor.fetchone()
-
-            if existing:
-                self.logger.info(f"BUY nível {grid_index} já existe. Ignorando.")
-            else:
-                # Criação real / simulada
-                self.place_order(next_price, "BUY", grid_index)
-
-                free_quote -= cost_est
-                orders_created += 1
-
-                msg = (
-                    f"🟦 BUY criada nível {grid_index}\n"
-                    f"Preço: {next_price:.2f}\n"
-                    f"Qtd: {amount_temp:.6f}\n"
-                    f"Custo: {cost_est:.2f} {self.QUOTE_ASSET}\n"
-                    f"Saldo restante: {free_quote:.2f} {self.QUOTE_ASSET}"
-                )
-
-                self.logger.info(msg.replace("\n", " | "))
-                self.telegram_send(msg)
-
-            # Próxima BUY mais abaixo
-            next_price -= self.grid_step
-            grid_index += 1
-
-        resumo = (
-            f"🟦 GRID COMPACTO INICIADO\n"
-            f"Ordens BUY criadas: {orders_created}\n"
-            f"Saldo inicial: {saldo_inicial:.2f} {self.QUOTE_ASSET}\n"
-            f"Saldo final: {free_quote:.2f} {self.QUOTE_ASSET}"
-        )
-
-        self.telegram_send(resumo)
-        self.logger.info(resumo.replace("\n", " | "))
+        ...
 
     # --------------------------------------
     # FUNÇÕES AUXILIARES DE ORDERS (REAL)
@@ -497,6 +418,19 @@ class GridBot:
                 pass
 
         return avg_price, filled, fee_cost, fee_currency
+
+    def _has_minimum_quote_balance(self):
+        """
+        Verifica se há saldo mínimo de quote (USDT) para montar o grid.
+        Usa o maior valor entre:
+        - INVESTMENT_PER_GRID
+        - min_cost da Binance para o par
+        """
+        free_quote = self.get_free_balance(self.QUOTE_ASSET)
+        min_needed = max(self.INVESTMENT_PER_GRID, self.min_cost or 0)
+
+        return free_quote >= min_needed, free_quote, min_needed
+
 
     # --------------------------------------
     # ORDENS
